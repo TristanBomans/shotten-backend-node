@@ -1,0 +1,12 @@
+.git
+.env
+.env.*
+docker-compose.yml
+node_modules
+dist
+logbackups
+*.log
+*.dump
+.DS_Store
+.idea
+.vscode

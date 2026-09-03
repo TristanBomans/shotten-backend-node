@@ -1,0 +1,13 @@
+services:
+  backend-node:
+    image: ghcr.io/tristanbomans/shotten-backend-node:latest
+    restart: unless-stopped
+    ports:
+      - "8094:8094"
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      PORT: 8094
+    volumes:
+      - ./backups:/backups
+      - ./logs:/logs
