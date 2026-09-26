@@ -37,6 +37,31 @@ export interface LzvMatchData {
   home_team_id?: number | null;
   away_team_id?: number | null;
   status?: "Scheduled" | "Played" | "Postponed";
+  /** Id of lzvcup.be/results/detail/{id}, present once the match has a result page. */
+  lzv_result_id?: number | null;
+}
+
+export interface LzvLineupPlayer {
+  playerId: number | null;
+  name: string;
+  number: number | null;
+  captain: boolean;
+  goals: number;
+  assists: number;
+}
+
+export interface LzvMatchDetailData {
+  result_id: number;
+  date: Date | null;
+  location: string | null;
+  home_team: string;
+  away_team: string;
+  home_team_id: number | null;
+  away_team_id: number | null;
+  home_score: number | null;
+  away_score: number | null;
+  home_lineup: LzvLineupPlayer[];
+  away_lineup: LzvLineupPlayer[];
 }
 
 export interface LzvPlayerData {

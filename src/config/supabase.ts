@@ -6,7 +6,7 @@
  */
 
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import { LzvTeamData, LzvMatchData, LzvPlayerData, CoreMatchData } from '../types/supabase.types';
+import { LzvTeamData, LzvMatchData, LzvPlayerData, CoreMatchData, LzvMatchDetailData } from '../types/supabase.types';
 import { config } from './env';
 
 // ============================================================================
@@ -63,6 +63,50 @@ export async function upsertLzvMatch(data: LzvMatchData): Promise<void> {
             status: data.status || 'Scheduled'
         }, { onConflict: 'external_id' });
     
+    if (error) throw error;
+}
+
+// ============================================================================
+// LZV MATCH DETAILS
+// ============================================================================
+
+/** Result page ids known on lzv_matches, with the latest kick-off per id. */
+export async function getLzvResultIds(): Promise<{ resultId: number; date: string }[]> {
+    const { data, error } = await getSupabase()
+        .from('lzv_matches')
+        .select('lzv_result_id, date')
+        .not('lzv_result_id', 'is', null);
+
+    if (error) throw error;
+    const byId = new Map<number, string>();
+    for (const row of data || []) {
+        byId.set(row.lzv_result_id, row.date);
+    }
+    return [...byId.entries()].map(([resultId, date]) => ({ resultId, date }));
+}
+
+/** Stored result ids, mapped to whether both lineups were filled in. */
+export async function getScrapedLzvMatchDetails(): Promise<Map<number, boolean>> {
+    const { data, error } = await getSupabase()
+        .from('lzv_match_details')
+        .select('result_id, home_lineup, away_lineup');
+
+    if (error) throw error;
+    return new Map((data || []).map(row => [
+        row.result_id,
+        (row.home_lineup?.length ?? 0) > 0 && (row.away_lineup?.length ?? 0) > 0,
+    ]));
+}
+
+export async function upsertLzvMatchDetail(data: LzvMatchDetailData): Promise<void> {
+    const { error } = await getSupabase()
+        .from('lzv_match_details')
+        .upsert({
+            ...data,
+            date: data.date ? data.date.toISOString() : null,
+            scraped_at: new Date().toISOString(),
+        }, { onConflict: 'result_id' });
+
     if (error) throw error;
 }
 
