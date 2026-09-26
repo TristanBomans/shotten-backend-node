@@ -53,7 +53,7 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.package.outputs.version }}
 
-      # Only the upstream repo deploys to the homeserver; forks just get an image.
+      # Only the upstream repo deploys; forks just get an image.
       - name: Deploy through the allowlisted worker
         if: github.repository == 'TristanBomans/shotten-backend-node'
         env:

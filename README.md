@@ -79,9 +79,4 @@ Backups need `pg_dump` 17 on your PATH; the Docker image already includes it.
 
 ## Deployment (upstream)
 
-Pushing to `main` runs `.github/workflows/container-deploy.yml`:
-
-1. builds the image and pushes `sha-<commit>`, `<package version>` and `latest` tags to GHCR;
-2. sends an HMAC-signed request (secret `DEPLOY_WEBHOOK_SECRET`) to the homeserver deploy agent, which pins the `shotten` Portainer stack to `sha-<commit>`.
-
-Configuration and secrets live in the Portainer stack, never in this repo.
+Pushing to `main` runs `.github/workflows/container-deploy.yml`: it pushes the image to GHCR (`sha-<commit>`, `<package version>` and `latest`) and then triggers an HMAC-signed deploy webhook (secret `DEPLOY_WEBHOOK_SECRET`). Configuration and secrets live with the deployment, never in this repo.

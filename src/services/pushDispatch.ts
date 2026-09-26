@@ -24,8 +24,9 @@ const FLUSH_BATCH = 50;
 const MAX_ATTEMPTS = 5;
 const PUSH_TTL_SECONDS = 12 * 60 * 60;
 
-// Endpoints come from browsers via the PWA, and this runs on the homeserver:
-// only talk to the real push services so a forged endpoint can't reach the LAN.
+// Endpoints come from browsers via the PWA, and this worker usually runs on a
+// private network: only talk to the real push services so a forged endpoint
+// can't reach internal hosts.
 const PUSH_SERVICE_HOSTS = [
     'fcm.googleapis.com',
     'updates.push.services.mozilla.com',
