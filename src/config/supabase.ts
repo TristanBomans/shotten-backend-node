@@ -357,3 +357,86 @@ export async function createAttendances(matchId: number, playerIds: number[]) {
     
     if (error && !error.message.includes('duplicate')) throw error;
 }
+
+// ============================================================================
+// WEB PUSH
+// ============================================================================
+
+export interface PushSubscriptionRow {
+    endpoint: string;
+    p256dh: string;
+    auth: string;
+    player_id: number | null;
+}
+
+export interface PushOutboxRow {
+    id: number;
+    endpoint: string;
+    title: string;
+    body: string;
+    url: string | null;
+    tag: string | null;
+    attempts: number;
+    push_subscriptions: { p256dh: string; auth: string } | null;
+}
+
+export async function getPushSubscriptionsForPlayers(playerIds: number[]): Promise<PushSubscriptionRow[]> {
+    if (playerIds.length === 0) return [];
+    const { data, error } = await getSupabase()
+        .from('push_subscriptions')
+        .select('endpoint, p256dh, auth, player_id')
+        .in('player_id', playerIds);
+
+    if (error) throw error;
+    return data || [];
+}
+
+/** Inserts sent markers and returns only the ones that were new (i.e. not yet sent). */
+export async function claimPushSent(
+    rows: { player_id: number; match_id: number; kind: string }[],
+): Promise<{ player_id: number; match_id: number; kind: string }[]> {
+    if (rows.length === 0) return [];
+    const { data, error } = await getSupabase()
+        .from('push_sent')
+        .upsert(rows, { onConflict: 'player_id,match_id,kind', ignoreDuplicates: true })
+        .select('player_id, match_id, kind');
+
+    if (error) throw error;
+    return data || [];
+}
+
+export async function insertPushOutbox(
+    rows: { endpoint: string; title: string; body: string; url: string; tag: string }[],
+): Promise<void> {
+    if (rows.length === 0) return;
+    const { error } = await getSupabase().from('push_outbox').insert(rows);
+    if (error) throw error;
+}
+
+export async function getDuePushOutbox(now: Date, limit: number): Promise<PushOutboxRow[]> {
+    const { data, error } = await getSupabase()
+        .from('push_outbox')
+        .select('id, endpoint, title, body, url, tag, attempts, push_subscriptions(p256dh, auth)')
+        .lte('send_at', now.toISOString())
+        .order('send_at', { ascending: true })
+        .limit(limit);
+
+    if (error) throw error;
+    return (data || []) as unknown as PushOutboxRow[];
+}
+
+export async function deletePushOutbox(id: number): Promise<void> {
+    const { error } = await getSupabase().from('push_outbox').delete().eq('id', id);
+    if (error) throw error;
+}
+
+export async function recordPushOutboxFailure(id: number, attempts: number): Promise<void> {
+    const { error } = await getSupabase().from('push_outbox').update({ attempts }).eq('id', id);
+    if (error) throw error;
+}
+
+/** Drops a subscription the push service reported gone; its outbox rows cascade. */
+export async function deletePushSubscription(endpoint: string): Promise<void> {
+    const { error } = await getSupabase().from('push_subscriptions').delete().eq('endpoint', endpoint);
+    if (error) throw error;
+}
