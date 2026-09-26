@@ -18,6 +18,7 @@ import {
 } from '../config/supabase';
 import { LzvTeamData, LzvMatchData, LzvPlayerData } from '../types/supabase.types';
 import { linkCoreMatchesToLzv } from './linkCoreMatches';
+import { scrapeMissingMatchDetails } from './matchDetailScraper';
 import { lzvUrl } from '../config/env';
 
 const DELAY_MS = 500;
@@ -64,6 +65,14 @@ export class ScraperServiceSupabase {
             await this.scrapeTeamPlayers(teamId);
             await this.scrapeTeamDetails(teamId);
             await new Promise(resolve => setTimeout(resolve, DELAY_MS));
+        }
+
+        // Step 4: Result pages (lineups, goals, assists). Isolated so a failure
+        // here never blocks linking core matches.
+        try {
+            await scrapeMissingMatchDetails();
+        } catch (error) {
+            console.error('Error scraping match details:', error);
         }
 
         await linkCoreMatchesToLzv();
@@ -123,14 +132,15 @@ export class ScraperServiceSupabase {
                 if (homeTeamId) opponentIds.push(homeTeamId);
                 if (awayTeamId) opponentIds.push(awayTeamId);
 
-                // Score lives in the last column on lzvcup.be — not in the team-name separator ("VT 09 - 04United")
+                // Find the dedicated score column. It is not necessarily the last column:
+                // LZV currently renders a trailing result-details link after it.
+                const scorePattern = /^(\d+)\s*-\s*(\d+)$/;
                 const scoreColumnText = $(el)
                     .find('.item-row .item-col')
-                    .last()
-                    .text()
-                    .replace(/\u00a0/g, ' ')
-                    .trim();
-                const scoreMatch = scoreColumnText.match(/^(\d+)\s*-\s*(\d+)$/);
+                    .toArray()
+                    .map(column => $(column).text().replace(/\u00a0/g, ' ').trim())
+                    .find(columnText => scorePattern.test(columnText));
+                const scoreMatch = scoreColumnText?.match(scorePattern);
                 let homeScore = 0;
                 let awayScore = 0;
                 let status: 'Played' | 'Scheduled' = 'Scheduled';
@@ -147,6 +157,11 @@ export class ScraperServiceSupabase {
 
                 const externalId = `${teamId}_${year}${month}${day}${hour}${minute}_${homeTeam}_${awayTeam}`.replace(/\s+/g, '');
 
+                // Played matches link to /results/detail/{id}
+                const resultHref = $(el).find('a[href*="/results/detail/"]').attr('href') || '';
+                const resultIdMatch = resultHref.match(/\/results\/detail\/(\d+)/);
+                const lzvResultId = resultIdMatch ? parseInt(resultIdMatch[1], 10) : null;
+
                 const matchData: LzvMatchData = {
                     external_id: externalId,
                     date: matchDate,
@@ -158,7 +173,8 @@ export class ScraperServiceSupabase {
                     team_id: teamId,
                     home_team_id: homeTeamId,
                     away_team_id: awayTeamId,
-                    status
+                    status,
+                    lzv_result_id: lzvResultId
                 };
 
                 scrapedExternalIds.push(externalId);

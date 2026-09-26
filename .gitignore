@@ -32,3 +32,6 @@ Thumbs.db
 # Backups
 backups-supabase/
 *.dump
+
+# Local log archives
+logbackups/
