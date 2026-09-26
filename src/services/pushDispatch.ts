@@ -1,8 +1,15 @@
-import axios from 'axios';
+import webpush from 'web-push';
 import {
+    claimPushSent,
+    deletePushOutbox,
+    deletePushSubscription,
     getAttendancesByMatchIds,
     getCorePlayersWithTeams,
+    getDuePushOutbox,
+    getPushSubscriptionsForPlayers,
     getUpcomingCoreMatches,
+    insertPushOutbox,
+    recordPushOutboxFailure,
 } from '../config/supabase';
 import { config } from '../config/env';
 
@@ -13,6 +20,19 @@ const TIME_ZONE = config.timezone;
 const APP_ORIGIN = config.push.appOrigin;
 const LOOKAHEAD_DAYS = 16;
 const HOUR_MS = 60 * 60 * 1000;
+const FLUSH_BATCH = 50;
+const MAX_ATTEMPTS = 5;
+const PUSH_TTL_SECONDS = 12 * 60 * 60;
+
+// Endpoints come from browsers via the PWA, and this runs on the homeserver:
+// only talk to the real push services so a forged endpoint can't reach the LAN.
+const PUSH_SERVICE_HOSTS = [
+    'fcm.googleapis.com',
+    'updates.push.services.mozilla.com',
+    'web.push.apple.com',
+    '.push.apple.com',
+    '.notify.windows.com',
+];
 
 export interface MatchForPush {
     id: number;
@@ -144,12 +164,23 @@ function matchDeepLink(matchId: number): string {
     return `${APP_ORIGIN}${path}`;
 }
 
+export function isPushServiceEndpoint(endpoint: string): boolean {
+    let url: URL;
+    try {
+        url = new URL(endpoint);
+    } catch {
+        return false;
+    }
+    if (url.protocol !== 'https:') return false;
+    return PUSH_SERVICE_HOSTS.some((host) =>
+        host.startsWith('.') ? url.hostname.endsWith(host) : url.hostname === host,
+    );
+}
+
 let isRunning = false;
 
 export async function dispatchMatchPushNotifications(now: Date = new Date()): Promise<void> {
-    const enqueueUrl = config.push.enqueueUrl;
-    const secret = config.push.secret;
-    if (!config.features.push || !enqueueUrl || !secret) return;
+    if (!config.features.push) return;
     if (isRunning) return;
     isRunning = true;
 
@@ -204,34 +235,112 @@ export async function dispatchMatchPushNotifications(now: Date = new Date()): Pr
 
         if (items.length === 0) return;
 
-        for (let index = 0; index < items.length; index += 50) {
-            const batch = items.slice(index, index + 50);
-            const response = await axios.post(
-                enqueueUrl,
-                { items: batch },
-                {
-                    headers: { Authorization: `Bearer ${secret}` },
-                    timeout: 20_000,
-                    validateStatus: () => true,
-                },
-            );
-            if (response.status >= 400) {
-                console.error(
-                    `Push enqueue HTTP ${response.status}:`,
-                    typeof response.data === 'string' ? response.data.slice(0, 300) : response.data,
-                );
-                continue;
-            }
-            const queued = Number(response.data?.queued ?? 0);
-            if (queued > 0) {
-                console.log(
-                    `Push enqueue: queued=${queued} duplicate=${response.data?.duplicate ?? 0} nosub=${response.data?.nosub ?? 0}`,
-                );
-            }
+        // Only claim reminders for players with a device, so someone who turns
+        // notifications on later still gets the next due reminder.
+        const subscriptions = await getPushSubscriptionsForPlayers([...new Set(items.map((item) => item.playerId))]);
+        const subsByPlayer = new Map<number, typeof subscriptions>();
+        for (const sub of subscriptions) {
+            if (sub.player_id == null) continue;
+            if (!subsByPlayer.has(sub.player_id)) subsByPlayer.set(sub.player_id, []);
+            subsByPlayer.get(sub.player_id)!.push(sub);
+        }
+        const reachable = items.filter((item) => subsByPlayer.has(item.playerId));
+        if (reachable.length === 0) return;
+
+        const claimed = await claimPushSent(reachable.map((item) => ({
+            player_id: item.playerId,
+            match_id: item.matchId,
+            kind: item.kind,
+        })));
+        const claimedKeys = new Set(claimed.map((row) => `${row.player_id}:${row.match_id}:${row.kind}`));
+
+        const outbox = reachable
+            .filter((item) => claimedKeys.has(`${item.playerId}:${item.matchId}:${item.kind}`))
+            .flatMap((item) => subsByPlayer.get(item.playerId)!.map((sub) => ({
+                endpoint: sub.endpoint,
+                title: item.title,
+                body: item.body,
+                url: item.url,
+                tag: item.kind,
+            })));
+
+        await insertPushOutbox(outbox);
+        if (outbox.length > 0) {
+            console.log(`Push dispatch: queued=${outbox.length} reminders=${claimed.length}`);
         }
     } catch (error) {
         console.error('Match push dispatch failed:', error);
     } finally {
         isRunning = false;
+    }
+}
+
+let isFlushing = false;
+
+export async function flushPushOutbox(now: Date = new Date()): Promise<void> {
+    if (!config.features.push) return;
+    if (isFlushing) return;
+    isFlushing = true;
+
+    let sent = 0;
+    let failed = 0;
+    let gone = 0;
+
+    try {
+        const rows = await getDuePushOutbox(now, FLUSH_BATCH);
+        const vapidDetails = {
+            subject: config.push.vapidSubject,
+            publicKey: config.push.vapidPublicKey,
+            privateKey: config.push.vapidPrivateKey,
+        };
+
+        for (const row of rows) {
+            const keys = row.push_subscriptions;
+            if (!keys || !isPushServiceEndpoint(row.endpoint)) {
+                await deletePushSubscription(row.endpoint);
+                gone += 1;
+                continue;
+            }
+
+            try {
+                await webpush.sendNotification(
+                    { endpoint: row.endpoint, keys: { p256dh: keys.p256dh, auth: keys.auth } },
+                    JSON.stringify({
+                        title: row.title,
+                        body: row.body,
+                        tag: row.tag || 'shotten',
+                        data: { url: row.url || '/' },
+                    }),
+                    { vapidDetails, TTL: PUSH_TTL_SECONDS, timeout: 15_000 },
+                );
+                await deletePushOutbox(row.id);
+                sent += 1;
+            } catch (error) {
+                const status = (error as { statusCode?: number }).statusCode;
+                if (status === 404 || status === 410) {
+                    await deletePushSubscription(row.endpoint);
+                    gone += 1;
+                    continue;
+                }
+
+                failed += 1;
+                const attempts = row.attempts + 1;
+                console.error(`Push send failed (id=${row.id}, status=${status ?? 'n/a'}, attempt=${attempts}):`,
+                    (error as { body?: string }).body?.slice(0, 300) || (error as Error).message);
+                if (attempts >= MAX_ATTEMPTS) {
+                    await deletePushOutbox(row.id);
+                } else {
+                    await recordPushOutboxFailure(row.id, attempts);
+                }
+            }
+        }
+
+        if (sent > 0 || failed > 0 || gone > 0) {
+            console.log(`Push outbox flushed: sent=${sent} failed=${failed} gone=${gone}`);
+        }
+    } catch (error) {
+        console.error('Push outbox flush failed:', error);
+    } finally {
+        isFlushing = false;
     }
 }

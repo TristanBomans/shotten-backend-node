@@ -28,11 +28,16 @@ function stripTrailingSlash(value: string): string {
   return value.replace(/\/+$/, "");
 }
 
-function deriveEnqueueUrl(flushUrl: string): string {
-  if (/\/flush\/?$/i.test(flushUrl)) {
-    return flushUrl.replace(/\/flush\/?$/i, "/enqueue");
+// Accepts the raw base64url private key or the JWK form (its "d" field).
+function parseVapidPrivateKey(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith("{")) return trimmed;
+  try {
+    const jwk = JSON.parse(trimmed) as { d?: unknown };
+    return typeof jwk.d === "string" ? jwk.d : "";
+  } catch {
+    return "";
   }
-  return `${stripTrailingSlash(flushUrl)}/enqueue`;
 }
 
 const features = {
@@ -57,12 +62,13 @@ const lzvBaseUrl = stripTrailingSlash(
   process.env.LZV_BASE_URL || "https://www.lzvcup.be",
 );
 
-const pushFlushUrl = (process.env.PUSH_FLUSH_URL || "").trim();
-const pushEnqueueUrl = (process.env.PUSH_ENQUEUE_URL || "").trim();
-const pushSecret = process.env.PUSH_FLUSH_SECRET || "";
+const vapidPublicKey = (process.env.VAPID_PUBLIC_KEY || "").trim();
+const vapidPrivateKey = parseVapidPrivateKey(process.env.VAPID_PRIVATE_KEY || "");
+const vapidSubject = (process.env.VAPID_SUBJECT || "").trim();
 const pushAppOrigin = stripTrailingSlash(process.env.PUSH_APP_ORIGIN || "");
 
-const pushEnabled = features.push && Boolean(pushFlushUrl && pushSecret);
+const pushEnabled =
+  features.push && Boolean(vapidPublicKey && vapidPrivateKey && vapidSubject);
 
 export const config = {
   port: parseInt(process.env.PORT || "3001", 10),
@@ -83,10 +89,9 @@ export const config = {
     baseUrl: lzvBaseUrl,
   },
   push: {
-    flushUrl: pushFlushUrl,
-    enqueueUrl:
-      pushEnqueueUrl || (pushFlushUrl ? deriveEnqueueUrl(pushFlushUrl) : ""),
-    secret: pushSecret,
+    vapidPublicKey,
+    vapidPrivateKey,
+    vapidSubject,
     appOrigin: pushAppOrigin,
   },
   backup: {
@@ -133,7 +138,7 @@ export function validateConfig(): void {
 
   if (features.push && !pushEnabled) {
     console.warn(
-      "FEATURE_PUSH is enabled but PUSH_FLUSH_URL or PUSH_FLUSH_SECRET is missing; push jobs disabled",
+      "FEATURE_PUSH is enabled but VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY or VAPID_SUBJECT is missing; push jobs disabled",
     );
   }
 
@@ -162,8 +167,7 @@ export function logConfigSummary(): void {
   }
   console.log(`LZV base URL: ${config.lzv.baseUrl}`);
   if (config.features.push) {
-    console.log(`Push flush: ${config.push.flushUrl}`);
-    console.log(`Push enqueue: ${config.push.enqueueUrl}`);
+    console.log(`Push VAPID subject: ${config.push.vapidSubject}`);
     if (config.push.appOrigin) {
       console.log(`Push app origin: ${config.push.appOrigin}`);
     }

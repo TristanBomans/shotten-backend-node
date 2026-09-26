@@ -15,11 +15,10 @@
 import express, { Response } from "express";
 import cors from "cors";
 import cron from "node-cron";
-import axios from "axios";
 import { ScraperServiceSupabase } from "./services/scraperSupabase";
 import { MatchSyncServiceSupabase } from "./services/matchSyncServiceSupabase";
 import { BackupService } from "./services/backupService";
-import { dispatchMatchPushNotifications } from "./services/pushDispatch";
+import { dispatchMatchPushNotifications, flushPushOutbox } from "./services/pushDispatch";
 import { getSupabase } from "./config/supabase";
 import { LoggerService } from "./services/loggerService";
 import { linkCoreMatchesToLzv } from "./services/linkCoreMatches";
@@ -95,38 +94,6 @@ if (config.features.backup) {
       .then(() => console.log("Daily backup completed successfully."))
       .catch((err) => console.error("Daily backup failed:", err));
   });
-}
-
-async function flushPushOutbox() {
-  const url = config.push.flushUrl;
-  const secret = config.push.secret;
-  if (!url || !secret) return;
-
-  try {
-    const response = await axios.post(url, null, {
-      headers: { Authorization: `Bearer ${secret}` },
-      timeout: 20_000,
-      validateStatus: () => true,
-    });
-
-    if (response.status >= 400) {
-      console.error(
-        `Push outbox flush HTTP ${response.status}:`,
-        typeof response.data === "string"
-          ? response.data.slice(0, 300)
-          : response.data,
-      );
-      return;
-    }
-
-    const sent = Number(response.data?.sent ?? 0);
-    const failed = Number(response.data?.failed ?? 0);
-    if (sent > 0 || failed > 0) {
-      console.log(`Push outbox flushed: sent=${sent} failed=${failed}`);
-    }
-  } catch (error) {
-    console.error("Push outbox flush failed:", error);
-  }
 }
 
 if (config.features.push) {
