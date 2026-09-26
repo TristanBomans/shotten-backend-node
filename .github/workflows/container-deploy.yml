@@ -1,0 +1,84 @@
+name: Build and deploy container
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: shotten-backend-node-production
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read application version
+        id: package
+        run: |
+          version=$(node -p "require('./package.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # Forks publish to their own GHCR namespace; GHCR requires lowercase.
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push immutable image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ steps.package.outputs.image }}:sha-${{ github.sha }}
+            ${{ steps.package.outputs.image }}:${{ steps.package.outputs.version }}
+            ${{ steps.package.outputs.image }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.package.outputs.version }}
+
+      # Only the upstream repo deploys to the homeserver; forks just get an image.
+      - name: Deploy through the allowlisted worker
+        if: github.repository == 'TristanBomans/shotten-backend-node'
+        env:
+          DEPLOY_SECRET: ${{ secrets.DEPLOY_WEBHOOK_SECRET }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl --fail --silent --show-error --max-time 15 https://deploy.trisbom.com/health > /dev/null
+          timestamp=$(date +%s)
+          delivery=$(cat /proc/sys/kernel/random/uuid)
+          body=$(jq -cn \
+            --arg project "shotten-backend-node" \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --arg commit "${GITHUB_SHA}" \
+            '{project:$project,repository:$repository,commit:$commit}')
+          signature=$(printf '%s.%s' "$timestamp" "$body" | openssl dgst -sha256 -hmac "$DEPLOY_SECRET" -hex | awk '{print $2}')
+          registry_auth=$(jq -cn \
+            --arg username "$GITHUB_REPOSITORY_OWNER" \
+            --arg password "$REGISTRY_TOKEN" \
+            '{username:$username,password:$password}' | base64 -w 0)
+          curl --fail-with-body --silent --show-error \
+            --max-time 180 \
+            --request POST https://deploy.trisbom.com/deploy \
+            --header "Content-Type: application/json" \
+            --header "X-Deploy-Timestamp: $timestamp" \
+            --header "X-Deploy-Signature: sha256=$signature" \
+            --header "X-Deploy-Delivery: $delivery" \
+            --header "X-Registry-Auth: $registry_auth" \
+            --data "$body"
