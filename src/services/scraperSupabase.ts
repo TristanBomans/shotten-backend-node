@@ -19,6 +19,7 @@ import {
 import { LzvTeamData, LzvMatchData, LzvPlayerData } from '../types/supabase.types';
 import { linkCoreMatchesToLzv } from './linkCoreMatches';
 import { scrapeMissingMatchDetails } from './matchDetailScraper';
+import { notifyNewResults } from './resultPush';
 import { lzvUrl } from '../config/env';
 
 const DELAY_MS = 500;
@@ -76,6 +77,12 @@ export class ScraperServiceSupabase {
         }
 
         await linkCoreMatchesToLzv();
+
+        try {
+            await notifyNewResults();
+        } catch (error) {
+            console.error('Error queueing result pushes:', error);
+        }
 
         console.log('Full scrape completed (Supabase).');
     }

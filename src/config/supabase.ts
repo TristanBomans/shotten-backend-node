@@ -66,6 +66,21 @@ export async function upsertLzvMatch(data: LzvMatchData): Promise<void> {
     if (error) throw error;
 }
 
+/** Played matches of the given LZV teams kicked off since `since`. */
+export async function getPlayedLzvMatchesSince(teamIds: number[], since: Date) {
+    if (teamIds.length === 0) return [];
+
+    const { data, error } = await getSupabase()
+        .from('lzv_matches')
+        .select('id, date, home_team, away_team, home_score, away_score, team_id, home_team_id, away_team_id, lzv_result_id')
+        .in('team_id', teamIds)
+        .eq('status', 'Played')
+        .gte('date', since.toISOString());
+
+    if (error) throw error;
+    return data || [];
+}
+
 // ============================================================================
 // LZV MATCH DETAILS
 // ============================================================================
@@ -406,7 +421,7 @@ export async function claimPushSent(
 }
 
 export async function insertPushOutbox(
-    rows: { endpoint: string; title: string; body: string; url: string; tag: string }[],
+    rows: { endpoint: string; title: string; body: string; url: string; tag: string; send_at?: string }[],
 ): Promise<void> {
     if (rows.length === 0) return;
     const { error } = await getSupabase().from('push_outbox').insert(rows);
