@@ -14,7 +14,7 @@ import {
 import { config } from '../config/env';
 
 export type AttendanceStatus = 'Present' | 'NotPresent' | 'Maybe' | null;
-export type PushKind = 'attendance_2w' | 'attendance_eve' | 'kickoff_morning' | 'kickoff_1h';
+export type PushKind = 'attendance_2w' | 'attendance_eve' | 'kickoff_morning' | 'kickoff_1h' | 'result';
 
 const TIME_ZONE = config.timezone;
 const APP_ORIGIN = config.push.appOrigin;
@@ -51,7 +51,7 @@ export interface PushItem {
     url: string;
 }
 
-function brusselsParts(date: Date) {
+export function brusselsParts(date: Date) {
     const parts = new Intl.DateTimeFormat('en-GB', {
         timeZone: TIME_ZONE,
         year: 'numeric',
@@ -153,7 +153,7 @@ export function buildPushCopy(kind: PushKind, match: MatchForPush, status: Atten
     };
 }
 
-function playerPlaysForTeam(teamIds: unknown, teamId: number | null | undefined): boolean {
+export function playerPlaysForTeam(teamIds: unknown, teamId: number | null | undefined): boolean {
     if (teamId == null) return false;
     if (!Array.isArray(teamIds)) return false;
     return teamIds.map(Number).includes(Number(teamId));
@@ -176,6 +176,47 @@ export function isPushServiceEndpoint(endpoint: string): boolean {
     return PUSH_SERVICE_HOSTS.some((host) =>
         host.startsWith('.') ? url.hostname.endsWith(host) : url.hostname === host,
     );
+}
+
+/**
+ * Claims each item once per player/match/kind in push_sent and queues it for
+ * every device of that player. Returns how many items and outbox rows were new.
+ */
+export async function queuePushItems(items: PushItem[], sendAt?: Date): Promise<{ claimed: number; outbox: number }> {
+    if (items.length === 0) return { claimed: 0, outbox: 0 };
+
+    // Only claim for players with a device, so someone who turns
+    // notifications on later still gets the next due one.
+    const subscriptions = await getPushSubscriptionsForPlayers([...new Set(items.map((item) => item.playerId))]);
+    const subsByPlayer = new Map<number, typeof subscriptions>();
+    for (const sub of subscriptions) {
+        if (sub.player_id == null) continue;
+        if (!subsByPlayer.has(sub.player_id)) subsByPlayer.set(sub.player_id, []);
+        subsByPlayer.get(sub.player_id)!.push(sub);
+    }
+    const reachable = items.filter((item) => subsByPlayer.has(item.playerId));
+    if (reachable.length === 0) return { claimed: 0, outbox: 0 };
+
+    const claimed = await claimPushSent(reachable.map((item) => ({
+        player_id: item.playerId,
+        match_id: item.matchId,
+        kind: item.kind,
+    })));
+    const claimedKeys = new Set(claimed.map((row) => `${row.player_id}:${row.match_id}:${row.kind}`));
+
+    const outbox = reachable
+        .filter((item) => claimedKeys.has(`${item.playerId}:${item.matchId}:${item.kind}`))
+        .flatMap((item) => subsByPlayer.get(item.playerId)!.map((sub) => ({
+            endpoint: sub.endpoint,
+            title: item.title,
+            body: item.body,
+            url: item.url,
+            tag: item.kind,
+            ...(sendAt ? { send_at: sendAt.toISOString() } : {}),
+        })));
+
+    await insertPushOutbox(outbox);
+    return { claimed: claimed.length, outbox: outbox.length };
 }
 
 let isRunning = false;
@@ -234,40 +275,9 @@ export async function dispatchMatchPushNotifications(now: Date = new Date()): Pr
             }
         }
 
-        if (items.length === 0) return;
-
-        // Only claim reminders for players with a device, so someone who turns
-        // notifications on later still gets the next due reminder.
-        const subscriptions = await getPushSubscriptionsForPlayers([...new Set(items.map((item) => item.playerId))]);
-        const subsByPlayer = new Map<number, typeof subscriptions>();
-        for (const sub of subscriptions) {
-            if (sub.player_id == null) continue;
-            if (!subsByPlayer.has(sub.player_id)) subsByPlayer.set(sub.player_id, []);
-            subsByPlayer.get(sub.player_id)!.push(sub);
-        }
-        const reachable = items.filter((item) => subsByPlayer.has(item.playerId));
-        if (reachable.length === 0) return;
-
-        const claimed = await claimPushSent(reachable.map((item) => ({
-            player_id: item.playerId,
-            match_id: item.matchId,
-            kind: item.kind,
-        })));
-        const claimedKeys = new Set(claimed.map((row) => `${row.player_id}:${row.match_id}:${row.kind}`));
-
-        const outbox = reachable
-            .filter((item) => claimedKeys.has(`${item.playerId}:${item.matchId}:${item.kind}`))
-            .flatMap((item) => subsByPlayer.get(item.playerId)!.map((sub) => ({
-                endpoint: sub.endpoint,
-                title: item.title,
-                body: item.body,
-                url: item.url,
-                tag: item.kind,
-            })));
-
-        await insertPushOutbox(outbox);
-        if (outbox.length > 0) {
-            console.log(`Push dispatch: queued=${outbox.length} reminders=${claimed.length}`);
+        const queued = await queuePushItems(items);
+        if (queued.outbox > 0) {
+            console.log(`Push dispatch: queued=${queued.outbox} reminders=${queued.claimed}`);
         }
     } catch (error) {
         console.error('Match push dispatch failed:', error);

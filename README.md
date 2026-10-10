@@ -18,7 +18,9 @@ All flags default to `true`. A job whose settings are missing is skipped with a 
 
 ### How push works
 
-The PWA stores each device's subscription in `push_subscriptions` (through its own `/api/push/*` routes). Every minute this worker works out which reminders are due, records them in `push_sent` so each one goes out only once, queues them in `push_outbox`, and sends them with the VAPID key pair. Subscriptions the push service reports as gone are deleted. Only endpoints of the browser push services (Google, Mozilla, Apple, Microsoft) are contacted.
+The PWA stores each device's subscription in `push_subscriptions` (through its own `/api/push/*` routes). Every minute this worker works out which reminders are due, records them in `push_sent` so each one goes out only once, queues them in `push_outbox`, and sends them with the VAPID key pair. Subscriptions the push service reports as gone are deleted.
+
+After each LZV scrape the worker also announces new results: the first time a score shows up for one of your own teams' matches (played in the last 4 days), every player of that team gets a push with the score, linking to the match details. Results found during the night are held until 08:00. Only endpoints of the browser push services (Google, Mozilla, Apple, Microsoft) are contacted.
 
 ## Running it for your own team
 
