@@ -57,10 +57,14 @@ jobs:
       - name: Deploy through the allowlisted worker
         if: github.repository == 'TristanBomans/shotten-backend-node'
         env:
+          DEPLOY_EDGE_KEY: ${{ secrets.DEPLOY_EDGE_KEY }}
           DEPLOY_SECRET: ${{ secrets.DEPLOY_WEBHOOK_SECRET }}
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          curl --fail --silent --show-error --max-time 15 https://deploy.trisbom.com/health > /dev/null
+          test -n "$DEPLOY_EDGE_KEY" || { echo "DEPLOY_EDGE_KEY is required" >&2; exit 1; }
+          curl --fail --silent --show-error --max-time 15 \
+            --header "X-Deploy-Key: $DEPLOY_EDGE_KEY" \
+            https://deploy.trisbom.com/health > /dev/null
           timestamp=$(date +%s)
           delivery=$(cat /proc/sys/kernel/random/uuid)
           body=$(jq -cn \
@@ -76,6 +80,7 @@ jobs:
           curl --fail-with-body --silent --show-error \
             --max-time 180 \
             --request POST https://deploy.trisbom.com/deploy \
+            --header "X-Deploy-Key: $DEPLOY_EDGE_KEY" \
             --header "Content-Type: application/json" \
             --header "X-Deploy-Timestamp: $timestamp" \
             --header "X-Deploy-Signature: sha256=$signature" \
