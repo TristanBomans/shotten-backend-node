@@ -31,10 +31,26 @@ export class ScraperServiceSupabase {
         return teams.map(team => ({ id: team.lzvExternalId, name: team.name }));
     }
 
+    private static running: Promise<void> | null = null;
+
+    static isRunning(): boolean {
+        return this.running !== null;
+    }
+
     /**
-     * Main entry point - scrapes everything
+     * Main entry point - scrapes everything. A call while a scrape is already
+     * running joins that scrape instead of starting a second one.
      */
-    static async scrapeAll() {
+    static scrapeAll(): Promise<void> {
+        if (!this.running) {
+            this.running = this.runFullScrape().finally(() => {
+                this.running = null;
+            });
+        }
+        return this.running;
+    }
+
+    private static async runFullScrape() {
         console.log('Starting full scrape (Supabase)...');
 
         const primaryTeams = await this.getPrimaryTeams();
@@ -88,125 +104,132 @@ export class ScraperServiceSupabase {
     }
 
     /**
+     * Pure HTML → data for /teams/overview/{teamId}: the team's fixtures and
+     * the ids of every team that appears in them.
+     */
+    static parseTeamMatches(html: string, teamId: number): { matches: LzvMatchData[]; opponentIds: number[] } {
+        const $ = cheerio.load(html);
+        const matches: LzvMatchData[] = [];
+        const opponentIds: number[] = [];
+
+        $('li').each((i, el) => {
+            const text = $(el).text();
+
+            // Look for date pattern: "wo 10/09/2025 22u00"
+            const dateMatch = text.match(/([a-z]{2})\s+(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2})u(\d{2})/i);
+            if (!dateMatch) return;
+
+            const [, , day, month, year, hour, minute] = dateMatch;
+            const yearNum = parseInt(year, 10);
+            const monthNum = parseInt(month, 10);
+            const dayNum = parseInt(day, 10);
+            const hourNum = parseInt(hour, 10);
+            const minuteNum = parseInt(minute, 10);
+
+            // LZV times are Belgian wall-clock; store as UTC components so host TZ cannot shift IDs/dates.
+            const matchDate = new Date(Date.UTC(yearNum, monthNum - 1, dayNum, hourNum, minuteNum));
+
+            // Find team links to extract team names and IDs
+            const teamLinks = $(el).find('a[href*="/teams/detail/"]');
+            if (teamLinks.length < 2) return;
+
+            const homeTeam = $(teamLinks[0]).text().trim();
+            const awayTeam = $(teamLinks[1]).text().trim();
+
+            // Extract team IDs from links
+            const homeLink = $(teamLinks[0]).attr('href') || '';
+            const awayLink = $(teamLinks[1]).attr('href') || '';
+            const homeIdMatch = homeLink.match(/\/(\d+)$/);
+            const awayIdMatch = awayLink.match(/\/(\d+)$/);
+
+            const homeTeamId = homeIdMatch ? parseInt(homeIdMatch[1], 10) : null;
+            const awayTeamId = awayIdMatch ? parseInt(awayIdMatch[1], 10) : null;
+
+            if (homeTeamId) opponentIds.push(homeTeamId);
+            if (awayTeamId) opponentIds.push(awayTeamId);
+
+            // Find the dedicated score column. It is not necessarily the last column:
+            // LZV currently renders a trailing result-details link after it.
+            const scorePattern = /^(\d+)\s*-\s*(\d+)$/;
+            const scoreColumnText = $(el)
+                .find('.item-row .item-col')
+                .toArray()
+                .map(column => $(column).text().replace(/\u00a0/g, ' ').trim())
+                .find(columnText => scorePattern.test(columnText));
+            const scoreMatch = scoreColumnText?.match(scorePattern);
+            let homeScore = 0;
+            let awayScore = 0;
+            let status: 'Played' | 'Scheduled' = 'Scheduled';
+
+            if (scoreMatch) {
+                homeScore = parseInt(scoreMatch[1], 10);
+                awayScore = parseInt(scoreMatch[2], 10);
+                status = 'Played';
+            }
+
+            // Find location
+            const locationLink = $(el).find('a[href*="/sportshalls/"]');
+            const location = locationLink.length > 0 ? locationLink.text().trim() : '';
+
+            const externalId = `${teamId}_${year}${month}${day}${hour}${minute}_${homeTeam}_${awayTeam}`.replace(/\s+/g, '');
+
+            // Played matches link to /results/detail/{id}
+            const resultHref = $(el).find('a[href*="/results/detail/"]').attr('href') || '';
+            const resultIdMatch = resultHref.match(/\/results\/detail\/(\d+)/);
+            const lzvResultId = resultIdMatch ? parseInt(resultIdMatch[1], 10) : null;
+
+            const matchData: LzvMatchData = {
+                external_id: externalId,
+                date: matchDate,
+                home_team: homeTeam,
+                away_team: awayTeam,
+                home_score: homeScore,
+                away_score: awayScore,
+                location,
+                team_id: teamId,
+                home_team_id: homeTeamId,
+                away_team_id: awayTeamId,
+                status,
+                lzv_result_id: lzvResultId
+            };
+
+            matches.push(matchData);
+        });
+
+        return { matches, opponentIds: [...new Set(opponentIds)] };
+    }
+
+    /**
      * Scrape matches for a specific team
      * Returns array of opponent team IDs found
      */
     static async scrapeTeamMatches(teamId: number): Promise<number[]> {
         console.log(`Scraping matches for team ${teamId}...`);
-        const opponentIds: number[] = [];
 
         try {
             const url = lzvUrl(`/teams/overview/${teamId}`);
             const { data } = await axios.get(url);
-            const $ = cheerio.load(data);
+            const { matches, opponentIds } = this.parseTeamMatches(data, teamId);
 
-            const matchPromises: Promise<void>[] = [];
-            const scrapedExternalIds: string[] = [];
-
-            $('li').each((i, el) => {
-                const text = $(el).text();
-
-                // Look for date pattern: "wo 10/09/2025 22u00"
-                const dateMatch = text.match(/([a-z]{2})\s+(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2})u(\d{2})/i);
-                if (!dateMatch) return;
-
-                const [, , day, month, year, hour, minute] = dateMatch;
-                const yearNum = parseInt(year, 10);
-                const monthNum = parseInt(month, 10);
-                const dayNum = parseInt(day, 10);
-                const hourNum = parseInt(hour, 10);
-                const minuteNum = parseInt(minute, 10);
-
-                // LZV times are Belgian wall-clock; store as UTC components so host TZ cannot shift IDs/dates.
-                const matchDate = new Date(Date.UTC(yearNum, monthNum - 1, dayNum, hourNum, minuteNum));
-
-                // Find team links to extract team names and IDs
-                const teamLinks = $(el).find('a[href*="/teams/detail/"]');
-                if (teamLinks.length < 2) return;
-
-                const homeTeam = $(teamLinks[0]).text().trim();
-                const awayTeam = $(teamLinks[1]).text().trim();
-
-                // Extract team IDs from links
-                const homeLink = $(teamLinks[0]).attr('href') || '';
-                const awayLink = $(teamLinks[1]).attr('href') || '';
-                const homeIdMatch = homeLink.match(/\/(\d+)$/);
-                const awayIdMatch = awayLink.match(/\/(\d+)$/);
-
-                const homeTeamId = homeIdMatch ? parseInt(homeIdMatch[1], 10) : null;
-                const awayTeamId = awayIdMatch ? parseInt(awayIdMatch[1], 10) : null;
-
-                if (homeTeamId) opponentIds.push(homeTeamId);
-                if (awayTeamId) opponentIds.push(awayTeamId);
-
-                // Find the dedicated score column. It is not necessarily the last column:
-                // LZV currently renders a trailing result-details link after it.
-                const scorePattern = /^(\d+)\s*-\s*(\d+)$/;
-                const scoreColumnText = $(el)
-                    .find('.item-row .item-col')
-                    .toArray()
-                    .map(column => $(column).text().replace(/\u00a0/g, ' ').trim())
-                    .find(columnText => scorePattern.test(columnText));
-                const scoreMatch = scoreColumnText?.match(scorePattern);
-                let homeScore = 0;
-                let awayScore = 0;
-                let status: 'Played' | 'Scheduled' = 'Scheduled';
-
-                if (scoreMatch) {
-                    homeScore = parseInt(scoreMatch[1], 10);
-                    awayScore = parseInt(scoreMatch[2], 10);
-                    status = 'Played';
-                }
-
-                // Find location
-                const locationLink = $(el).find('a[href*="/sportshalls/"]');
-                const location = locationLink.length > 0 ? locationLink.text().trim() : '';
-
-                const externalId = `${teamId}_${year}${month}${day}${hour}${minute}_${homeTeam}_${awayTeam}`.replace(/\s+/g, '');
-
-                // Played matches link to /results/detail/{id}
-                const resultHref = $(el).find('a[href*="/results/detail/"]').attr('href') || '';
-                const resultIdMatch = resultHref.match(/\/results\/detail\/(\d+)/);
-                const lzvResultId = resultIdMatch ? parseInt(resultIdMatch[1], 10) : null;
-
-                const matchData: LzvMatchData = {
-                    external_id: externalId,
-                    date: matchDate,
-                    home_team: homeTeam,
-                    away_team: awayTeam,
-                    home_score: homeScore,
-                    away_score: awayScore,
-                    location,
-                    team_id: teamId,
-                    home_team_id: homeTeamId,
-                    away_team_id: awayTeamId,
-                    status,
-                    lzv_result_id: lzvResultId
-                };
-
-                scrapedExternalIds.push(externalId);
-                matchPromises.push(upsertLzvMatch(matchData));
-            });
-
-            await Promise.all(matchPromises);
-            console.log(`Found ${matchPromises.length} matches for team ${teamId}`);
+            await Promise.all(matches.map(match => upsertLzvMatch(match)));
+            console.log(`Found ${matches.length} matches for team ${teamId}`);
 
             // Drop DB rows that disappeared from the LZV page (cancelled/rescheduled).
             // Skip when scrape found nothing — same safety posture as iCal sync.
-            if (scrapedExternalIds.length === 0) {
+            if (matches.length === 0) {
                 console.warn(`Skipping stale match cleanup for team ${teamId}: scrape returned 0 matches`);
             } else {
-                const removed = await deleteStaleLzvMatches(teamId, scrapedExternalIds);
+                const removed = await deleteStaleLzvMatches(teamId, matches.map(match => match.external_id));
                 if (removed > 0) {
                     console.log(`Removed ${removed} stale match(es) for team ${teamId}`);
                 }
             }
 
+            return opponentIds;
         } catch (error) {
             console.error(`Error scraping team ${teamId}:`, error);
+            return [];
         }
-
-        return [...new Set(opponentIds)]; // Return unique IDs
     }
 
     /**

@@ -2,7 +2,7 @@
  * Shotten Scraper Worker
  *
  * This is a minimal version of the backend that only runs the scheduled jobs:
- * - LZV Scraper (daily at 03:00)
+ * - LZV Scraper (daily at 03:00, and as soon as LZV shows a score after one of our matches)
  * - iCal Match Sync (every 4 hours)
  * - Web Push outbox flush (every minute)
  * - Match notification dispatch (attendance 2 weeks / evening before, kickoff morning / 1h)
@@ -16,6 +16,7 @@ import express, { Response } from "express";
 import cors from "cors";
 import cron from "node-cron";
 import { ScraperServiceSupabase } from "./services/scraperSupabase";
+import { checkForNewResults } from "./services/resultWatch";
 import { MatchSyncServiceSupabase } from "./services/matchSyncServiceSupabase";
 import { BackupService } from "./services/backupService";
 import { dispatchMatchPushNotifications, flushPushOutbox } from "./services/pushDispatch";
@@ -77,6 +78,10 @@ if (config.features.lzvScrape) {
   cron.schedule("0 3 * * *", () => {
     console.log("Running daily LZV scrape job...");
     ScraperServiceSupabase.scrapeAll();
+  });
+
+  cron.schedule("*/5 * * * *", () => {
+    void checkForNewResults();
   });
 }
 
@@ -357,6 +362,9 @@ app.listen(PORT, () => {
   console.log("Scheduled jobs:");
   console.log(
     `  - LZV Scraper: ${config.features.lzvScrape ? "Daily at 03:00" : "disabled"}`,
+  );
+  console.log(
+    `  - LZV result watch: ${config.features.lzvScrape ? "Every 5 minutes after our matches" : "disabled"}`,
   );
   console.log(
     `  - iCal Sync: ${config.features.icalSync ? "Every 4 hours" : "disabled"}`,

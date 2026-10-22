@@ -72,6 +72,12 @@ export function brusselsParts(date: Date) {
     };
 }
 
+/** Brussels wall-clock time as UTC components, the way lzv_matches.date is stored. */
+export function brusselsWallClock(date: Date): Date {
+    const parts = brusselsParts(date);
+    return new Date(Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute));
+}
+
 export function calendarDaysUntil(now: Date, matchDate: Date): number {
     const start = brusselsParts(now);
     const end = brusselsParts(matchDate);
