@@ -81,6 +81,22 @@ export async function getPlayedLzvMatchesSince(teamIds: number[], since: Date) {
     return data || [];
 }
 
+/** Not-yet-played matches of the given LZV teams kicked off between `from` and `to`. */
+export async function getUnplayedLzvMatchesBetween(teamIds: number[], from: Date, to: Date) {
+    if (teamIds.length === 0) return [];
+
+    const { data, error } = await getSupabase()
+        .from('lzv_matches')
+        .select('id, external_id, date, team_id')
+        .in('team_id', teamIds)
+        .neq('status', 'Played')
+        .gte('date', from.toISOString())
+        .lte('date', to.toISOString());
+
+    if (error) throw error;
+    return data || [];
+}
+
 // ============================================================================
 // LZV MATCH DETAILS
 // ============================================================================
@@ -401,6 +417,17 @@ export async function getPushSubscriptionsForPlayers(playerIds: number[]): Promi
         .from('push_subscriptions')
         .select('endpoint, p256dh, auth, player_id')
         .in('player_id', playerIds);
+
+    if (error) throw error;
+    return data || [];
+}
+
+/** Devices that turned on the hidden admin page. */
+export async function getAdminPushSubscriptions(): Promise<{ endpoint: string }[]> {
+    const { data, error } = await getSupabase()
+        .from('push_subscriptions')
+        .select('endpoint')
+        .eq('admin', true);
 
     if (error) throw error;
     return data || [];
