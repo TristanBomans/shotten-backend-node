@@ -246,6 +246,22 @@ export async function getUpcomingCoreMatches(from: Date, to: Date) {
     return data || [];
 }
 
+/** Played (past) core matches of the given teams since `from`, for attendance streaks. */
+export async function getPastCoreMatchesForTeams(teamIds: number[], from: Date, until: Date) {
+    if (teamIds.length === 0) return [];
+
+    const { data, error } = await getSupabase()
+        .from('core_matches')
+        .select('id, date, team_id, forfait')
+        .in('team_id', teamIds)
+        .gte('date', from.toISOString())
+        .lt('date', until.toISOString())
+        .order('date', { ascending: false });
+
+    if (error) throw error;
+    return data || [];
+}
+
 export async function getAttendancesByMatchIds(matchIds: number[]) {
     if (matchIds.length === 0) return [];
 
@@ -408,7 +424,7 @@ export interface PushOutboxRow {
     url: string | null;
     tag: string | null;
     attempts: number;
-    push_subscriptions: { p256dh: string; auth: string } | null;
+    push_subscriptions: { p256dh: string; auth: string; player_id: number | null } | null;
 }
 
 export async function getPushSubscriptionsForPlayers(playerIds: number[]): Promise<PushSubscriptionRow[]> {
@@ -458,7 +474,7 @@ export async function insertPushOutbox(
 export async function getDuePushOutbox(now: Date, limit: number): Promise<PushOutboxRow[]> {
     const { data, error } = await getSupabase()
         .from('push_outbox')
-        .select('id, endpoint, title, body, url, tag, attempts, push_subscriptions(p256dh, auth)')
+        .select('id, endpoint, title, body, url, tag, attempts, push_subscriptions(p256dh, auth, player_id)')
         .lte('send_at', now.toISOString())
         .order('send_at', { ascending: true })
         .limit(limit);

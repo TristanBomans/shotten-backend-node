@@ -5,6 +5,7 @@ import {
     deletePushSubscription,
     getAttendancesByMatchIds,
     getCorePlayersWithTeams,
+    getPastCoreMatchesForTeams,
     getDuePushOutbox,
     getPushSubscriptionsForPlayers,
     getUpcomingCoreMatches,
@@ -14,7 +15,24 @@ import {
 import { config } from '../config/env';
 
 export type AttendanceStatus = 'Present' | 'NotPresent' | 'Maybe' | null;
-export type PushKind = 'attendance_2w' | 'attendance_eve' | 'kickoff_morning' | 'kickoff_1h' | 'result';
+export type PushKind =
+    | 'attendance_2w'
+    | 'attendance_eve'
+    | 'streak_risk'
+    | 'kickoff_morning'
+    | 'kickoff_1h'
+    | 'result';
+
+/** Reminders that ask for an RSVP get "I'm in / Can't make it" buttons. */
+const RSVP_KINDS = new Set<string>(['attendance_2w', 'attendance_eve', 'streak_risk']);
+const RSVP_ACTIONS = [
+    { action: 'rsvp-present', title: "I'm in" },
+    { action: 'rsvp-absent', title: "Can't make it" },
+];
+
+/** A streak this long or longer turns the evening reminder into a streak_risk one. */
+export const STREAK_RISK_MIN = 3;
+const STREAK_LOOKBACK_DAYS = 400;
 
 const TIME_ZONE = config.timezone;
 const APP_ORIGIN = config.push.appOrigin;
@@ -107,6 +125,78 @@ export function kindsDue(now: Date, matchDate: Date, status: AttendanceStatus): 
     return kinds;
 }
 
+export interface PastMatchForStreak {
+    id: number;
+    date: string | Date;
+    team_id: number | null;
+    forfait?: boolean | null;
+}
+
+/**
+ * Current run of consecutive Present answers per player, newest match first.
+ * Counts matches the same way the PWA stats page does by default: past,
+ * not forfait, and at least one player Present.
+ */
+export function currentPresentStreaks(
+    players: { id: number; team_ids: unknown }[],
+    pastMatches: PastMatchForStreak[],
+    attendanceByMatch: Map<number, Map<number, AttendanceStatus>>,
+): Map<number, number> {
+    const counted = pastMatches
+        .filter((match) => !match.forfait)
+        .filter((match) => {
+            const byPlayer = attendanceByMatch.get(match.id);
+            return byPlayer ? [...byPlayer.values()].includes('Present') : false;
+        })
+        .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+    const streaks = new Map<number, number>();
+    for (const player of players) {
+        let streak = 0;
+        for (const match of counted) {
+            if (!playerPlaysForTeam(player.team_ids, match.team_id)) continue;
+            if (attendanceByMatch.get(match.id)?.get(player.id) !== 'Present') break;
+            streak += 1;
+        }
+        streaks.set(player.id, streak);
+    }
+    return streaks;
+}
+
+/** The match id in a `/?modal=match&modalId=…` deep link, if it is one. */
+export function matchIdFromDeepLink(url: string | null | undefined): number | null {
+    if (!url) return null;
+    try {
+        const parsed = new URL(url, 'https://app.invalid');
+        if (parsed.searchParams.get('modal') !== 'match') return null;
+        const id = Number(parsed.searchParams.get('modalId'));
+        return Number.isInteger(id) && id > 0 ? id : null;
+    } catch {
+        return null;
+    }
+}
+
+/** The JSON the service worker receives; see the PWA's public/sw.js. */
+export function buildPushPayload(row: { title: string; body: string; url: string | null; tag: string | null; playerId: number | null }) {
+    const url = row.url || '/';
+    const kind = row.tag || undefined;
+    const matchId = matchIdFromDeepLink(row.url);
+    const canRsvp = kind !== undefined && RSVP_KINDS.has(kind) && matchId != null && row.playerId != null;
+
+    return {
+        title: row.title,
+        body: row.body,
+        tag: row.tag || 'shotten',
+        data: {
+            url,
+            ...(kind ? { kind } : {}),
+            ...(matchId != null ? { matchId } : {}),
+            ...(row.playerId != null ? { playerId: row.playerId } : {}),
+        },
+        ...(canRsvp ? { actions: RSVP_ACTIONS } : {}),
+    };
+}
+
 function formatKickoffTime(matchDate: Date): string {
     return new Intl.DateTimeFormat('en-GB', {
         timeZone: TIME_ZONE,
@@ -116,9 +206,21 @@ function formatKickoffTime(matchDate: Date): string {
     }).format(matchDate);
 }
 
-export function buildPushCopy(kind: PushKind, match: MatchForPush, status: AttendanceStatus): { title: string; body: string } {
+export function buildPushCopy(
+    kind: PushKind,
+    match: MatchForPush,
+    status: AttendanceStatus,
+    streak = 0,
+): { title: string; body: string } {
     const matchLabel = match.name || 'Match';
     const time = formatKickoffTime(match.date);
+
+    if (kind === 'streak_risk') {
+        return {
+            title: `🔥 ${streak} matches in a row!`,
+            body: `Your streak is on the line — are you in for tomorrow's ${matchLabel}?`,
+        };
+    }
 
     if (kind === 'attendance_2w') {
         if (status === 'Maybe') {
@@ -243,6 +345,7 @@ export async function dispatchMatchPushNotifications(now: Date = new Date()): Pr
             getAttendancesByMatchIds(matchIds),
             getCorePlayersWithTeams(),
         ]);
+        const streaks = await loadStreaksIfEveningReminderDue(now, upcoming, attendances, players);
 
         const attendanceByMatch = new Map<number, Map<number, AttendanceStatus>>();
         for (const row of attendances) {
@@ -266,9 +369,12 @@ export async function dispatchMatchPushNotifications(now: Date = new Date()): Pr
             for (const player of players) {
                 if (!playerPlaysForTeam(player.team_ids, match.team_id)) continue;
                 const status = byPlayer.get(player.id) ?? null;
-                const due = kindsDue(now, matchDate, status);
+                const streak = streaks.get(player.id) ?? 0;
+                const due = kindsDue(now, matchDate, status).map((kind): PushKind =>
+                    kind === 'attendance_eve' && streak >= STREAK_RISK_MIN ? 'streak_risk' : kind,
+                );
                 for (const kind of due) {
-                    const copy = buildPushCopy(kind, matchInfo, status);
+                    const copy = buildPushCopy(kind, matchInfo, status, streak);
                     items.push({
                         playerId: player.id,
                         matchId: match.id,
@@ -289,6 +395,43 @@ export async function dispatchMatchPushNotifications(now: Date = new Date()): Pr
         console.error('Match push dispatch failed:', error);
     } finally {
         isRunning = false;
+    }
+}
+
+/**
+ * Streaks only matter for the evening-before reminder, so past matches are
+ * loaded only when at least one upcoming match is in that window.
+ */
+async function loadStreaksIfEveningReminderDue(
+    now: Date,
+    upcoming: { id: number; date: string; team_id: number | null }[],
+    attendances: { match_id: unknown; player_id: unknown; status: unknown }[],
+    players: { id: number; team_ids: unknown }[],
+): Promise<Map<number, number>> {
+    const eveningTeams = new Set<number>();
+    for (const match of upcoming) {
+        const matchDate = new Date(match.date);
+        if (Number.isNaN(matchDate.getTime()) || match.team_id == null) continue;
+        if (kindsDue(now, matchDate, null).includes('attendance_eve')) eveningTeams.add(Number(match.team_id));
+    }
+    if (eveningTeams.size === 0) return new Map();
+
+    try {
+        const since = new Date(now.getTime() - STREAK_LOOKBACK_DAYS * 86_400_000);
+        const pastMatches = await getPastCoreMatchesForTeams([...eveningTeams], since, now);
+        const pastAttendances = await getAttendancesByMatchIds(pastMatches.map((m) => m.id as number));
+
+        const byMatch = new Map<number, Map<number, AttendanceStatus>>();
+        for (const row of [...pastAttendances, ...attendances]) {
+            const matchId = row.match_id as number;
+            if (!byMatch.has(matchId)) byMatch.set(matchId, new Map());
+            byMatch.get(matchId)!.set(row.player_id as number, row.status as AttendanceStatus);
+        }
+        return currentPresentStreaks(players, pastMatches as PastMatchForStreak[], byMatch);
+    } catch (error) {
+        // Fall back to the plain evening reminder.
+        console.error('Streak lookup for push failed:', error);
+        return new Map();
     }
 }
 
@@ -322,12 +465,13 @@ export async function flushPushOutbox(now: Date = new Date()): Promise<void> {
             try {
                 await webpush.sendNotification(
                     { endpoint: row.endpoint, keys: { p256dh: keys.p256dh, auth: keys.auth } },
-                    JSON.stringify({
+                    JSON.stringify(buildPushPayload({
                         title: row.title,
                         body: row.body,
-                        tag: row.tag || 'shotten',
-                        data: { url: row.url || '/' },
-                    }),
+                        url: row.url,
+                        tag: row.tag,
+                        playerId: keys.player_id ?? null,
+                    })),
                     { vapidDetails, TTL: PUSH_TTL_SECONDS, timeout: 15_000 },
                 );
                 await deletePushOutbox(row.id);
