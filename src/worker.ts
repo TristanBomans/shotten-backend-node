@@ -286,6 +286,30 @@ app.get("/api/backup/status", (req, res) => {
 });
 
 /**
+ * DELETE /api/backup/:fileName
+ * Delete a single backup file
+ */
+app.delete("/api/backup/:fileName", (req, res) => {
+  if (!config.features.backup) return featureDisabled(res, "backup");
+
+  try {
+    BackupService.deleteBackup(req.params.fileName);
+    res.json({ success: true, message: "Backup deleted" });
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Failed to delete backup";
+    const notFound = message === "Backup not found";
+    const invalid = message === "Invalid backup file name";
+    if (!notFound && !invalid) {
+      console.error("Failed to delete backup:", error);
+    }
+    res
+      .status(notFound ? 404 : invalid ? 400 : 500)
+      .json({ success: false, error: message });
+  }
+});
+
+/**
  * GET /health
  * Health check endpoint
  */
@@ -392,6 +416,7 @@ app.listen(PORT, () => {
     console.log(`  - POST /api/backup/trigger`);
     console.log(`  - GET  /api/backup/list`);
     console.log(`  - GET  /api/backup/status`);
+    console.log(`  - DELETE /api/backup/:fileName`);
   }
   if (config.features.logs) {
     console.log(`  - GET  /api/logs`);

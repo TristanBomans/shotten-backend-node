@@ -17,6 +17,13 @@ function backupDir(): string {
     return config.backup.dir;
 }
 
+export interface BackupFileInfo {
+    fileName: string;
+    fileSize: string;
+    fileSizeBytes: number;
+    createdAt: string;
+}
+
 export class BackupService {
     /**
      * Run a full database backup
@@ -206,7 +213,7 @@ export class BackupService {
             return { hasBackups: false, totalCount: 0 };
         }
 
-        const latestFile = backups[0];
+        const latestFile = backups[0].fileName;
         const latestPath = join(backupDir(), latestFile);
         let fileSize = 'unknown';
         let createdAt = '';
@@ -298,7 +305,7 @@ export class BackupService {
     /**
      * List all available backups
      */
-    static listBackups(): string[] {
+    static listBackups(): BackupFileInfo[] {
         if (!existsSync(backupDir())) {
             return [];
         }
@@ -306,6 +313,44 @@ export class BackupService {
         return readdirSync(backupDir())
             .filter(file => file.startsWith('supabase_backup_') && file.endsWith('.dump'))
             .sort()
-            .reverse();
+            .reverse()
+            .map(file => {
+                const filePath = join(backupDir(), file);
+                let fileSize = 'unknown';
+                let fileSizeBytes = 0;
+                let createdAt = this.parseTimestampFromFileName(file);
+
+                try {
+                    const stats = statSync(filePath);
+                    fileSize = this.getFileSize(filePath);
+                    fileSizeBytes = stats.size;
+                    createdAt = new Date(stats.mtime).toISOString();
+                } catch {
+                    // Keep filename-derived fallbacks
+                }
+
+                return { fileName: file, fileSize, fileSizeBytes, createdAt };
+            });
+    }
+
+    /**
+     * Delete a single backup file by name.
+     * Rejects anything that is not a plain backup dump filename.
+     */
+    static deleteBackup(fileName: string): void {
+        if (!fileName.startsWith('supabase_backup_') || !fileName.endsWith('.dump')) {
+            throw new Error('Invalid backup file name');
+        }
+        if (fileName.includes('/') || fileName.includes('\\') || fileName.includes('..')) {
+            throw new Error('Invalid backup file name');
+        }
+
+        const filePath = join(backupDir(), fileName);
+        if (!existsSync(filePath)) {
+            throw new Error('Backup not found');
+        }
+
+        unlinkSync(filePath);
+        console.log(`Deleted backup: ${fileName}`);
     }
 }
