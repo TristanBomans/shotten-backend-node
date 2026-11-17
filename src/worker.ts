@@ -252,16 +252,65 @@ app.get("/api/backup/list", (req, res) => {
   if (!config.features.backup) return featureDisabled(res, "backup");
 
   try {
-    const backups = BackupService.listBackups();
+    const items = BackupService.listBackupSummaries();
     res.json({
       success: true,
-      backups,
-      count: backups.length,
+      backups: items.map((item) => item.fileName),
+      items,
+      count: items.length,
+      retentionDays: config.backup.retentionDays,
       backupDir: config.backup.dir,
     });
   } catch (error) {
     console.error("Failed to list backups:", error);
     res.status(500).json({ success: false, error: "Failed to list backups" });
+  }
+});
+
+/**
+ * GET /api/backup/files/:fileName
+ * Details for one backup, including the archive's table list (pg_restore --list)
+ */
+app.get("/api/backup/files/:fileName", async (req, res) => {
+  if (!config.features.backup) return featureDisabled(res, "backup");
+
+  const { fileName } = req.params;
+  if (!BackupService.isValidBackupName(fileName)) {
+    return res.status(400).json({ success: false, error: "Invalid backup name" });
+  }
+
+  try {
+    const details = await BackupService.getBackupDetails(fileName);
+    if (!details) {
+      return res.status(404).json({ success: false, error: "Backup not found" });
+    }
+    res.json({ success: true, backup: details });
+  } catch (error) {
+    console.error("Failed to read backup details:", error);
+    res.status(500).json({ success: false, error: "Failed to read backup details" });
+  }
+});
+
+/**
+ * DELETE /api/backup/files/:fileName
+ * Delete one backup file
+ */
+app.delete("/api/backup/files/:fileName", (req, res) => {
+  if (!config.features.backup) return featureDisabled(res, "backup");
+
+  const { fileName } = req.params;
+  if (!BackupService.isValidBackupName(fileName)) {
+    return res.status(400).json({ success: false, error: "Invalid backup name" });
+  }
+
+  try {
+    if (!BackupService.deleteBackup(fileName)) {
+      return res.status(404).json({ success: false, error: "Backup not found" });
+    }
+    res.json({ success: true, message: `Deleted ${fileName}` });
+  } catch (error) {
+    console.error("Failed to delete backup:", error);
+    res.status(500).json({ success: false, error: "Failed to delete backup" });
   }
 });
 
