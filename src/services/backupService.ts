@@ -5,13 +5,41 @@
  * Backups are stored in the configured backup directory.
  */
 
-import { exec } from 'child_process';
+import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
 import { existsSync, readdirSync, unlinkSync, statSync, writeFileSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { config } from '../config/env';
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+
+const BACKUP_FILE_PATTERN = /^supabase_backup_[A-Za-z0-9-]+\.dump$/;
+
+export interface BackupSummary {
+    fileName: string;
+    sizeBytes: number;
+    size: string;
+    createdAt: string | null;
+}
+
+export interface BackupDetails extends BackupSummary {
+    startedAt: string | null;
+    durationSeconds: number | null;
+    success: boolean | null;
+    isLatest: boolean;
+    ageHours: number | null;
+    expiresAt: string | null;
+    archive: {
+        dumpedFrom: string | null;
+        dumpedBy: string | null;
+        format: string | null;
+        compression: string | null;
+        entryCount: number;
+        tables: string[];
+    } | null;
+    archiveError?: string;
+}
 
 function backupDir(): string {
     return config.backup.dir;
@@ -293,6 +321,137 @@ export class BackupService {
             return `${y}-${m}-${d}T${h}:${min}:${s}.000Z`;
         }
         return '';
+    }
+
+    /** True when the name is a backup file this service manages (no paths, no other files). */
+    static isValidBackupName(fileName: string): boolean {
+        return BACKUP_FILE_PATTERN.test(fileName);
+    }
+
+    /** List backups with size and modification time, newest first. */
+    static listBackupSummaries(): BackupSummary[] {
+        return this.listBackups().map((fileName) => {
+            const filePath = join(backupDir(), fileName);
+            try {
+                const stats = statSync(filePath);
+                return {
+                    fileName,
+                    sizeBytes: stats.size,
+                    size: this.getFileSize(filePath),
+                    createdAt: stats.mtime.toISOString(),
+                };
+            } catch {
+                return {
+                    fileName,
+                    sizeBytes: 0,
+                    size: 'unknown',
+                    createdAt: this.parseTimestampFromFileName(fileName) || null,
+                };
+            }
+        });
+    }
+
+    /**
+     * Full details for one backup, including the archive's table of contents
+     * read with `pg_restore --list` (read-only, no database connection).
+     * Returns null when the file does not exist.
+     */
+    static async getBackupDetails(fileName: string): Promise<BackupDetails | null> {
+        if (!this.isValidBackupName(fileName)) return null;
+        const filePath = join(backupDir(), fileName);
+        if (!existsSync(filePath)) return null;
+
+        const stats = statSync(filePath);
+        const createdAt = stats.mtime.toISOString();
+        const startedAt = this.parseTimestampFromFileName(fileName) || null;
+        const latest = this.listBackups()[0];
+
+        let durationSeconds: number | null = null;
+        let success: boolean | null = null;
+        const status = this.readStatusFile();
+        if (status && status.fileName === fileName) {
+            durationSeconds = parseFloat((status.durationMs / 1000).toFixed(2));
+            success = status.success;
+        } else if (startedAt) {
+            const inferredMs = stats.mtime.getTime() - new Date(startedAt).getTime();
+            // mtime far from the filename's start time means the file was copied or touched later
+            if (inferredMs > 0 && inferredMs < 3_600_000) durationSeconds = parseFloat((inferredMs / 1000).toFixed(2));
+        }
+
+        const expires = new Date(stats.mtime);
+        expires.setDate(expires.getDate() + config.backup.retentionDays);
+
+        const details: BackupDetails = {
+            fileName,
+            sizeBytes: stats.size,
+            size: this.getFileSize(filePath),
+            createdAt,
+            startedAt,
+            durationSeconds,
+            success,
+            isLatest: latest === fileName,
+            ageHours: parseFloat(((Date.now() - stats.mtime.getTime()) / 3_600_000).toFixed(2)),
+            expiresAt: expires.toISOString(),
+            archive: null,
+        };
+
+        try {
+            const { stdout } = await execFileAsync('pg_restore', ['--list', filePath], {
+                timeout: 15_000,
+                maxBuffer: 16 * 1024 * 1024,
+            });
+            details.archive = this.parseArchiveList(stdout);
+        } catch (error) {
+            details.archiveError = error instanceof Error ? error.message.split('\n')[0] : 'pg_restore failed';
+        }
+
+        return details;
+    }
+
+    /** Delete one backup file. Returns false when it does not exist. */
+    static deleteBackup(fileName: string): boolean {
+        if (!this.isValidBackupName(fileName)) return false;
+        const filePath = join(backupDir(), fileName);
+        if (!existsSync(filePath)) return false;
+        unlinkSync(filePath);
+        console.log(`Deleted backup on request: ${fileName}`);
+        return true;
+    }
+
+    private static parseArchiveList(output: string): NonNullable<BackupDetails['archive']> {
+        const header = (label: string): string | null => {
+            const match = output.match(new RegExp(`^;\\s*${label}:\\s*(.+)$`, 'm'));
+            return match ? match[1].trim() : null;
+        };
+
+        const tables: string[] = [];
+        let entryCount = 0;
+        for (const line of output.split('\n')) {
+            if (!line || line.startsWith(';')) continue;
+            entryCount++;
+            // e.g. "3456; 0 16789 TABLE DATA public matches postgres"
+            const match = line.match(/^\d+; \d+ \d+ TABLE DATA (\S+) (\S+) /);
+            if (match) tables.push(`${match[1]}.${match[2]}`);
+        }
+
+        return {
+            dumpedFrom: header('Dumped from database version'),
+            dumpedBy: header('Dumped by pg_dump version'),
+            format: header('Format'),
+            compression: header('Compression'),
+            entryCount,
+            tables: tables.sort(),
+        };
+    }
+
+    private static readStatusFile(): { fileName: string; durationMs: number; success: boolean } | null {
+        try {
+            const statusPath = join(backupDir(), 'backup_status.json');
+            if (!existsSync(statusPath)) return null;
+            return JSON.parse(readFileSync(statusPath, 'utf8'));
+        } catch {
+            return null;
+        }
     }
 
     /**
